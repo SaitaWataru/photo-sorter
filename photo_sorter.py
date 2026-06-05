@@ -383,6 +383,24 @@ class PhotoSorterApp(tk.Tk):
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
 
+        # canvas座標 → 元画像座標 の変換情報 (scale, offset_x, offset_y, orig_w, orig_h)
+        self._display_info: tuple | None = None
+
+        # モザイク機能
+        self._mosaic_mode = False
+        self._mosaic_start: tuple[int, int] | None = None
+        self._mosaic_rect = None              # canvas上の選択矩形ID
+        self._mosaic_strength = tk.IntVar(value=20)  # ブロックサイズ: 10, 20, 40
+        self._mosaic_btn: tk.Label | None = None
+        self._mosaic_bar: tk.Frame | None = None
+
+        # トリミング機能
+        self._crop_mode = False
+        self._crop_start: tuple[int, int] | None = None
+        self._crop_rect = None                # canvas上の選択矩形ID
+        self._crop_btn: tk.Label | None = None
+        self._crop_bar: tk.Frame | None = None
+
         self._build_ui()
         self.after(100, self._start)
 
@@ -410,6 +428,10 @@ class PhotoSorterApp(tk.Tk):
             side="right", padx=(6, 0))
         _make_btn(toolbar, "📸  Instagramリサイズ", self._resize_for_instagram).pack(
             side="right", padx=(6, 0))
+        self._mosaic_btn = _make_btn(toolbar, "🔲  モザイク", self._toggle_mosaic_mode)
+        self._mosaic_btn.pack(side="right", padx=(6, 0))
+        self._crop_btn = _make_btn(toolbar, "✂  トリミング", self._toggle_crop_mode)
+        self._crop_btn.pack(side="right", padx=(6, 0))
 
         # ── プログレスバー（3px線）──────────────
         _separator(self).pack(fill="x")
@@ -417,6 +439,39 @@ class PhotoSorterApp(tk.Tk):
             self, height=3, bg=BG_SURFACE, highlightthickness=0
         )
         self._prog_canvas.pack(fill="x")
+
+        # ── モザイクコントロールバー（モザイクモード時のみ表示）──
+        self._mosaic_bar = tk.Frame(self, bg=BG_SURFACE, padx=16, pady=8)
+        tk.Label(
+            self._mosaic_bar, text="🔲  モザイクモード：ドラッグして範囲を選択（元画像は別ファイルとして保存されます）",
+            font=("", 9), fg=T_PRIMARY, bg=BG_SURFACE
+        ).pack(side="left")
+        tk.Label(
+            self._mosaic_bar, text="　粗さ：",
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE
+        ).pack(side="left")
+        for label, val in (("細かい", 10), ("普通", 20), ("粗い", 40)):
+            tk.Radiobutton(
+                self._mosaic_bar, text=label, variable=self._mosaic_strength, value=val,
+                font=("", 9), fg=T_PRIMARY, bg=BG_SURFACE, selectcolor=BG_WIDGET,
+                activebackground=BG_SURFACE, activeforeground=T_PRIMARY,
+                highlightthickness=0, bd=0
+            ).pack(side="left", padx=(2, 0))
+        tk.Label(
+            self._mosaic_bar, text="　（ボタン再クリックで解除）",
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE
+        ).pack(side="left")
+
+        # ── トリミングコントロールバー（トリミングモード時のみ表示）──
+        self._crop_bar = tk.Frame(self, bg="#1a2a1a", padx=16, pady=8)
+        tk.Label(
+            self._crop_bar, text="✂  トリミングモード：ドラッグして範囲を選択（元画像は別ファイルとして保存されます）",
+            font=("", 9), fg=T_PRIMARY, bg="#1a2a1a"
+        ).pack(side="left")
+        tk.Label(
+            self._crop_bar, text="　（ボタン再クリックで解除）",
+            font=("", 9), fg=T_SECONDARY, bg="#1a2a1a"
+        ).pack(side="left")
 
         # ── 画像キャンバス ──────────────────────
         self.canvas = tk.Canvas(self, bg=CANVAS_BG, highlightthickness=0)
@@ -763,12 +818,20 @@ class PhotoSorterApp(tk.Tk):
         try:
             img = Image.open(path)
             img = ImageOps.exif_transpose(img)   # EXIF向き補正（縦撮り写真を正しく表示）
+            orig_w, orig_h = img.size
             img.thumbnail((cw, ch), Image.LANCZOS)
+            disp_w, disp_h = img.size
+            offset_x = (cw - disp_w) // 2
+            offset_y = (ch - disp_h) // 2
+            # 表示スケール（canvas座標 → 元画像座標 の変換係数）
+            scale = orig_w / disp_w
+            self._display_info = (scale, offset_x, offset_y, orig_w, orig_h)
             self._photo_image = ImageTk.PhotoImage(img)
             self.canvas.create_image(
                 cw // 2, ch // 2, anchor="center", image=self._photo_image
             )
         except Exception as e:
+            self._display_info = None
             self.canvas.create_text(
                 cw // 2, ch // 2,
                 text=f"画像を読み込めませんでした\n{e}",
@@ -776,6 +839,7 @@ class PhotoSorterApp(tk.Tk):
             )
 
     def _show_with_tk(self, path: Path, cw: int, ch: int):
+        self._display_info = None
         suffix = path.suffix.lower()
         if suffix not in {".png", ".gif"}:
             self.canvas.create_text(
@@ -796,6 +860,298 @@ class PhotoSorterApp(tk.Tk):
                 text=f"画像を読み込めませんでした\n{e}",
                 fill=T_SECONDARY, font=("", 12), justify="center"
             )
+
+    # ── 画像保存ユーティリティ ────────────────
+
+    def _derived_path(self, src: Path, marker: str) -> Path:
+        """元ファイルと別名（{stem}_{marker}{suffix}）の保存先を返す。重複時は連番。"""
+        dst = src.with_name(f"{src.stem}_{marker}{src.suffix}")
+        counter = 1
+        while dst.exists():
+            dst = src.with_name(f"{src.stem}_{marker}_{counter}{src.suffix}")
+            counter += 1
+        return dst
+
+    def _save_image(self, img: "Image.Image", path: Path):
+        """拡張子に応じてフォーマットを維持して保存"""
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(path, "JPEG", quality=95, subsampling=0)
+        elif suffix == ".png":
+            img.save(path, "PNG")
+        elif suffix == ".webp":
+            img.save(path, "WEBP", quality=95)
+        else:
+            img.save(path)
+
+    def _insert_derived(self, path: Path):
+        """生成した派生ファイルを現在位置の直後に挿入して選択を移す。"""
+        self.photos.insert(self.current_index + 1, path)
+        self.current_index += 1
+
+    # ── モザイク機能 ──────────────────────────
+
+    def _toggle_mosaic_mode(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Pillowが必要です",
+                "この機能にはPillowが必要です。\n\n  pip install Pillow\n\nインストール後に再起動してください。"
+            )
+            return
+        if self._mosaic_mode:
+            self._exit_mosaic_mode()
+        else:
+            self._enter_mosaic_mode()
+
+    def _enter_mosaic_mode(self):
+        if self._crop_mode:
+            self._exit_crop_mode()
+        self._mosaic_mode = True
+        self._mosaic_btn.config(bg="#7c3aed", text="🔲  モザイク解除")
+        self._mosaic_btn.bind("<Enter>", lambda e: self._mosaic_btn.config(bg="#9333ea"))
+        self._mosaic_btn.bind("<Leave>", lambda e: self._mosaic_btn.config(bg="#7c3aed"))
+        self._mosaic_bar.pack(fill="x", after=self._prog_canvas)
+        self.canvas.config(cursor="crosshair")
+        self.canvas.bind("<ButtonPress-1>",   self._mosaic_press)
+        self.canvas.bind("<B1-Motion>",        self._mosaic_move)
+        self.canvas.bind("<ButtonRelease-1>",  self._mosaic_release)
+
+    def _exit_mosaic_mode(self):
+        self._mosaic_mode = False
+        self._mosaic_btn.config(bg=BG_WIDGET, text="🔲  モザイク")
+        self._mosaic_btn.bind("<Enter>", lambda e: self._mosaic_btn.config(bg=BG_HOVER))
+        self._mosaic_btn.bind("<Leave>", lambda e: self._mosaic_btn.config(bg=BG_WIDGET))
+        self._mosaic_bar.pack_forget()
+        self.canvas.config(cursor="")
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        if self._mosaic_rect:
+            self.canvas.delete(self._mosaic_rect)
+            self._mosaic_rect = None
+        self._mosaic_start = None
+
+    def _mosaic_press(self, event):
+        self._mosaic_start = (event.x, event.y)
+        if self._mosaic_rect:
+            self.canvas.delete(self._mosaic_rect)
+            self._mosaic_rect = None
+
+    def _mosaic_move(self, event):
+        if not self._mosaic_start:
+            return
+        if self._mosaic_rect:
+            self.canvas.delete(self._mosaic_rect)
+        x0, y0 = self._mosaic_start
+        self._mosaic_rect = self.canvas.create_rectangle(
+            x0, y0, event.x, event.y,
+            outline="#ff4444", width=2, dash=(6, 3)
+        )
+
+    def _mosaic_release(self, event):
+        if not self._mosaic_start:
+            return
+        x0, y0 = self._mosaic_start
+        x1, y1 = event.x, event.y
+        self._mosaic_start = None
+
+        rx0, rx1 = min(x0, x1), max(x0, x1)
+        ry0, ry1 = min(y0, y1), max(y0, y1)
+
+        if rx1 - rx0 < 5 or ry1 - ry0 < 5:
+            if self._mosaic_rect:
+                self.canvas.delete(self._mosaic_rect)
+                self._mosaic_rect = None
+            return
+
+        self._apply_mosaic_to_selection(rx0, ry0, rx1, ry1)
+
+    def _apply_mosaic_to_selection(self, cx0: int, cy0: int, cx1: int, cy1: int):
+        if not self._display_info or not self.photos:
+            return
+
+        scale, offset_x, offset_y, orig_w, orig_h = self._display_info
+
+        # canvas座標 → 元画像座標に変換
+        ix0 = int((cx0 - offset_x) * scale)
+        iy0 = int((cy0 - offset_y) * scale)
+        ix1 = int((cx1 - offset_x) * scale)
+        iy1 = int((cy1 - offset_y) * scale)
+
+        # 元画像の範囲内にクランプ
+        ix0 = max(0, min(ix0, orig_w))
+        iy0 = max(0, min(iy0, orig_h))
+        ix1 = max(0, min(ix1, orig_w))
+        iy1 = max(0, min(iy1, orig_h))
+
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+
+        block_size = self._mosaic_strength.get()
+        photo_path = self.photos[self.current_index]
+
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+
+            region = img.crop((ix0, iy0, ix1, iy1))
+            rw, rh = region.size
+
+            # ピクセル化：縮小してから拡大
+            small_w = max(1, rw // block_size)
+            small_h = max(1, rh // block_size)
+            small = region.resize((small_w, small_h), Image.BOX)
+            pixelated = small.resize((rw, rh), Image.NEAREST)
+
+            img.paste(pixelated, (ix0, iy0))
+
+            # 元画像は変更せず、新しいファイルとして保存
+            out_path = self._derived_path(photo_path, "モザイク")
+            self._save_image(img, out_path)
+
+            if self._mosaic_rect:
+                self.canvas.delete(self._mosaic_rect)
+                self._mosaic_rect = None
+
+            self._insert_derived(out_path)
+            self._show_current()
+            self._show_toast(f"🔲  モザイク画像を生成  {out_path.name}")
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"モザイクの適用に失敗しました:\n{e}")
+
+    # ── トリミング機能 ────────────────────────
+
+    def _toggle_crop_mode(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Pillowが必要です",
+                "この機能にはPillowが必要です。\n\n  pip install Pillow\n\nインストール後に再起動してください。"
+            )
+            return
+        if self._crop_mode:
+            self._exit_crop_mode()
+        else:
+            self._enter_crop_mode()
+
+    def _enter_crop_mode(self):
+        if self._mosaic_mode:
+            self._exit_mosaic_mode()
+        self._crop_mode = True
+        self._crop_btn.config(bg="#065f46", text="✂  トリミング解除")
+        self._crop_btn.bind("<Enter>", lambda e: self._crop_btn.config(bg="#047857"))
+        self._crop_btn.bind("<Leave>", lambda e: self._crop_btn.config(bg="#065f46"))
+        self._crop_bar.pack(fill="x", after=self._prog_canvas)
+        self.canvas.config(cursor="crosshair")
+        self.canvas.bind("<ButtonPress-1>",  self._crop_press)
+        self.canvas.bind("<B1-Motion>",       self._crop_move)
+        self.canvas.bind("<ButtonRelease-1>", self._crop_release)
+
+    def _exit_crop_mode(self):
+        self._crop_mode = False
+        self._crop_btn.config(bg=BG_WIDGET, text="✂  トリミング")
+        self._crop_btn.bind("<Enter>", lambda e: self._crop_btn.config(bg=BG_HOVER))
+        self._crop_btn.bind("<Leave>", lambda e: self._crop_btn.config(bg=BG_WIDGET))
+        self._crop_bar.pack_forget()
+        self.canvas.config(cursor="")
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+        self._crop_start = None
+
+    def _crop_press(self, event):
+        self._crop_start = (event.x, event.y)
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+
+    def _crop_move(self, event):
+        if not self._crop_start:
+            return
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+        x0, y0 = self._crop_start
+        self._crop_rect = self.canvas.create_rectangle(
+            x0, y0, event.x, event.y,
+            outline="#22c55e", width=2, dash=(6, 3)
+        )
+
+    def _crop_release(self, event):
+        if not self._crop_start:
+            return
+        x0, y0 = self._crop_start
+        x1, y1 = event.x, event.y
+        self._crop_start = None
+
+        rx0, rx1 = min(x0, x1), max(x0, x1)
+        ry0, ry1 = min(y0, y1), max(y0, y1)
+
+        if rx1 - rx0 < 5 or ry1 - ry0 < 5:
+            if self._crop_rect:
+                self.canvas.delete(self._crop_rect)
+                self._crop_rect = None
+            return
+
+        self._confirm_and_apply_crop(rx0, ry0, rx1, ry1)
+
+    def _confirm_and_apply_crop(self, cx0: int, cy0: int, cx1: int, cy1: int):
+        if not self._display_info or not self.photos:
+            return
+
+        scale, offset_x, offset_y, orig_w, orig_h = self._display_info
+
+        ix0 = int((cx0 - offset_x) * scale)
+        iy0 = int((cy0 - offset_y) * scale)
+        ix1 = int((cx1 - offset_x) * scale)
+        iy1 = int((cy1 - offset_y) * scale)
+
+        ix0 = max(0, min(ix0, orig_w))
+        iy0 = max(0, min(iy0, orig_h))
+        ix1 = max(0, min(ix1, orig_w))
+        iy1 = max(0, min(iy1, orig_h))
+
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+
+        crop_w = ix1 - ix0
+        crop_h = iy1 - iy0
+        photo_path = self.photos[self.current_index]
+
+        confirmed = messagebox.askyesno(
+            "トリミングの確認",
+            f"選択範囲を切り出して新しい画像を生成しますか？\n\n"
+            f"  サイズ: {crop_w} × {crop_h} px\n"
+            f"  元ファイル: {photo_path.name}\n\n"
+            "元の画像はそのまま残ります。",
+        )
+
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+
+        if not confirmed:
+            return
+
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            cropped = img.crop((ix0, iy0, ix1, iy1))
+
+            # 元画像は変更せず、新しいファイルとして保存
+            out_path = self._derived_path(photo_path, "トリミング")
+            self._save_image(cropped, out_path)
+
+            self._insert_derived(out_path)
+            self._show_current()
+            self._show_toast(f"✂  トリミング画像を生成  {out_path.name}")
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"トリミングに失敗しました:\n{e}")
 
     def _show_done(self):
         self.filename_label.config(text="")
