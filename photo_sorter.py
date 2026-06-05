@@ -473,7 +473,7 @@ class PhotoSorterApp(tk.Tk):
         # ── モザイクコントロールバー（モザイクモード時のみ表示）──
         self._mosaic_bar = tk.Frame(self, bg=BG_SURFACE, padx=16, pady=8)
         tk.Label(
-            self._mosaic_bar, text="🔲  モザイクモード：ドラッグして範囲を選択",
+            self._mosaic_bar, text="🔲  モザイクモード：ドラッグして範囲を選択（元画像は別ファイルとして保存）",
             font=("", 9, "bold"), fg=T_PRIMARY, bg=BG_SURFACE
         ).pack(side="left", padx=(0, 20))
         tk.Label(
@@ -499,7 +499,7 @@ class PhotoSorterApp(tk.Tk):
             font=("", 9, "bold"), fg=T_PRIMARY, bg="#1a2a1a"
         ).pack(side="left", padx=(0, 20))
         tk.Label(
-            self._crop_bar, text="範囲を決定すると確認ダイアログが表示されます",
+            self._crop_bar, text="範囲決定後、元画像とは別ファイルとして生成します",
             font=("", 9), fg=T_SECONDARY, bg="#1a2a1a"
         ).pack(side="left")
         tk.Label(
@@ -952,9 +952,11 @@ class PhotoSorterApp(tk.Tk):
     # ── 共通ユーティリティ ────────────────────────────────────
 
     def _save_image(self, img: "Image.Image", path: Path):
-        """フォーマットを維持して画像を上書き保存"""
+        """フォーマットを維持して画像を保存"""
         suffix = path.suffix.lower()
         if suffix in {".jpg", ".jpeg"}:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
             img.save(path, "JPEG", quality=95, subsampling=0)
         elif suffix == ".png":
             img.save(path, "PNG")
@@ -962,6 +964,20 @@ class PhotoSorterApp(tk.Tk):
             img.save(path, "WEBP", quality=95)
         else:
             img.save(path)
+
+    def _derived_path(self, src: Path, marker: str) -> Path:
+        """元ファイルと別名（{stem}_{marker}{suffix}）の保存先を返す。重複時は連番。"""
+        dst = src.with_name(f"{src.stem}_{marker}{src.suffix}")
+        counter = 1
+        while dst.exists():
+            dst = src.with_name(f"{src.stem}_{marker}_{counter}{src.suffix}")
+            counter += 1
+        return dst
+
+    def _insert_derived(self, path: Path):
+        """生成した派生ファイルを現在位置の直後に挿入して選択を移す。"""
+        self.photos.insert(self.current_index + 1, path)
+        self.current_index += 1
 
     # ── 回転・反転 ────────────────────────────────────────────
 
@@ -1347,7 +1363,6 @@ class PhotoSorterApp(tk.Tk):
         photo_path = self.photos[self.current_index]
 
         try:
-            backup = photo_path.read_bytes()
             img = Image.open(photo_path)
             img = ImageOps.exif_transpose(img)
 
@@ -1361,15 +1376,18 @@ class PhotoSorterApp(tk.Tk):
             pixelated = small.resize((rw, rh), Image.NEAREST)
 
             img.paste(pixelated, (ix0, iy0))
-            self._save_image(img, photo_path)
-            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "🔲 モザイク"})
+
+            # 元画像は変更せず、新しいファイルとして保存
+            out_path = self._derived_path(photo_path, "モザイク")
+            self._save_image(img, out_path)
 
             if self._mosaic_rect:
                 self.canvas.delete(self._mosaic_rect)
                 self._mosaic_rect = None
 
+            self._insert_derived(out_path)
             self._show_current()
-            self._show_toast("モザイク適用完了")
+            self._show_toast(f"🔲  モザイク画像を生成  {out_path.name}")
 
         except Exception as e:
             messagebox.showerror("エラー", f"モザイクの適用に失敗しました:\n{e}")
@@ -1477,11 +1495,10 @@ class PhotoSorterApp(tk.Tk):
 
         confirmed = messagebox.askyesno(
             "トリミングの確認",
-            f"選択範囲にトリミングしますか？\n\n"
+            f"選択範囲を切り出して新しい画像を生成しますか？\n\n"
             f"  サイズ: {crop_w} × {crop_h} px\n"
-            f"  ファイル: {photo_path.name}\n\n"
-            "この操作は元に戻せません。",
-            icon="warning"
+            f"  元ファイル: {photo_path.name}\n\n"
+            "元の画像はそのまま残ります。",
         )
 
         if self._crop_rect:
@@ -1496,18 +1513,13 @@ class PhotoSorterApp(tk.Tk):
             img = ImageOps.exif_transpose(img)
             cropped = img.crop((ix0, iy0, ix1, iy1))
 
-            suffix = photo_path.suffix.lower()
-            if suffix in {".jpg", ".jpeg"}:
-                cropped.save(photo_path, "JPEG", quality=95, subsampling=0)
-            elif suffix == ".png":
-                cropped.save(photo_path, "PNG")
-            elif suffix == ".webp":
-                cropped.save(photo_path, "WEBP", quality=95)
-            else:
-                cropped.save(photo_path)
+            # 元画像は変更せず、新しいファイルとして保存
+            out_path = self._derived_path(photo_path, "トリミング")
+            self._save_image(cropped, out_path)
 
+            self._insert_derived(out_path)
             self._show_current()
-            self._show_toast(f"✂  トリミング完了  {crop_w}×{crop_h}px")
+            self._show_toast(f"✂  トリミング画像を生成  {out_path.name}")
 
         except Exception as e:
             messagebox.showerror("エラー", f"トリミングに失敗しました:\n{e}")
